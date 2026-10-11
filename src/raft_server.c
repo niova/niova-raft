@@ -89,6 +89,7 @@ static struct
     bool               log_only;
     raft_entry_idx_t   inject_idx;
     unsigned int       inject_xor;
+    int                inject_role; // 0 any, 1 leader, 2 follower
     bool               quorum;
     raft_entry_idx_t   quorum_verified_idx;
     unsigned long long quorum_decisions;
@@ -173,6 +174,10 @@ raft_server_ev_init(void)
     const char *xm = getenv("NIOVA_EV_INJECT_XOR");
     if (xm)
         raftEv.inject_xor = (unsigned int)strtoul(xm, NULL, 0) & 0xff;
+    const char *role = getenv("NIOVA_EV_INJECT_ROLE");
+    if (role)
+        raftEv.inject_role = !strcmp(role, "leader") ? 1 :
+                             !strcmp(role, "follower") ? 2 : 0;
     const char *pol = getenv("NIOVA_EV_POLICY");
     raftEv.quorum = (pol && !strcmp(pol, "quorum"));
     for (int i = 0; i < CTL_SVC_MAX_RAFT_PEERS; i++)
@@ -5480,7 +5485,9 @@ raft_server_state_machine_apply(struct raft_instance *ri)
 
         raft_server_ev_init();
         if (raftEv.inject_idx >= 0 && nai.rla_idx == raftEv.inject_idx &&
-            i == nai.rla_sub_idx)
+            i == nai.rla_sub_idx &&
+            (raftEv.inject_role == 0 ||
+             (raftEv.inject_role == 1) == raft_instance_is_leader(ri)))
         {
             raftNetEvInjectArmed = true;
             raftNetEvInjectXor = raftEv.inject_xor;
