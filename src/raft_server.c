@@ -64,6 +64,16 @@ static unsigned long long raftServerMaxRecoveryLeaderCommMsec = 10000;
 typedef void *raft_server_rw_thread_t;
 typedef void  raft_server_rw_thread_ctx_t;
 
+static void
+raft_server_verify_leader_kv_checksum(
+    struct raft_instance *,
+    const struct raft_append_entries_request_msg *);
+
+static void
+raft_server_verify_follower_kv_checksum(
+    struct raft_instance *,
+    const struct raft_append_entries_reply_msg *);
+
 static const char *
 raft_server_may_accept_client_request_reason(struct raft_instance *ri);
 
@@ -2588,6 +2598,8 @@ raft_server_leader_init_append_entry_msg(struct raft_instance *ri,
     raerq->raerqm_leader_change_marker = 0;
     raerq->raerqm_lowest_index = niova_atomic_read(&ri->ri_lowest_idx);
     raerq->raerqm_chkpt_index = ri->ri_checkpoint_last_idx;
+    raerq->raerqm_last_applied_index = ri->ri_last_applied.rla_idx;
+    raerq->raerqm_last_applied_kv_crc = ri->ri_last_applied.rla_kv_cumulative_crc;
     memset(raerq->raerqm_size_arr, 0,
            (sizeof(uint32_t) * RAFT_ENTRY_NUM_ENTRIES));
 
@@ -3228,6 +3240,10 @@ raft_server_process_append_entries_request_prep_reply(
 
     reply->rrm_append_entries_reply.raerpm_heartbeat_msg =
         raerq->raerqm_heartbeat_msg;
+    reply->rrm_append_entries_reply.raerpm_last_applied_index =
+        ri->ri_last_applied.rla_idx;
+    reply->rrm_append_entries_reply.raerpm_last_applied_kv_crc =
+        ri->ri_last_applied.rla_kv_cumulative_crc;
 
     const raft_entry_idx_t current_idx =
         raft_server_get_current_raft_entry_index(ri, RI_NEHDR_SYNC);
@@ -3457,8 +3473,12 @@ raft_server_process_append_entries_request(struct raft_instance *ri,
      * to do any further processing of this msg, send a reply back to the
      * leader asking for it to update it's sli for this peer.
      */
-    else if (!update_sli)
+    else
     {
+        raft_server_verify_leader_kv_checksum(ri, raerq);
+
+        if (!update_sli)
+        {
         bool advance_commit_idx = false;
         raft_entry_idx_t new_commit_idx = raerq->raerqm_commit_index;
 
@@ -3499,6 +3519,7 @@ raft_server_process_append_entries_request(struct raft_instance *ri,
          */
         if (advance_commit_idx)
             raft_server_advance_commit_idx(ri, new_commit_idx);
+        }
     }
 
     // Issue reply
@@ -3860,6 +3881,7 @@ raft_server_process_append_entries_reply(struct raft_instance *ri,
     }
     else
     {
+        raft_server_verify_follower_kv_checksum(ri, raerp);
         raft_server_apply_append_entries_reply_result(ri, sender_csn->csn_uuid,
                                                       raerp);
     }
@@ -4903,6 +4925,65 @@ raft_server_sm_apply_opt(struct raft_instance *ri,
         ri->ri_backend->rib_sm_apply_opt(ri, ws);
 }
 
+static void
+raft_server_assert_kv_checksum_match(struct raft_instance *ri,
+                                     const char *context,
+                                     raft_entry_idx_t apply_idx,
+                                     uint32_t expected_crc,
+                                     uint32_t observed_crc)
+{
+    if (expected_crc == observed_crc)
+        return;
+
+    SIMPLE_LOG_MSG(LL_FATAL,
+                   "KV checksum mismatch (%s) apply-idx=%ld expected=%#x observed=%#x",
+                   context, apply_idx, expected_crc, observed_crc);
+    DBG_RAFT_INSTANCE(LL_FATAL, ri, "kv checksum mismatch detected");
+    NIOVA_ASSERT(0);
+}
+
+static void
+raft_server_verify_leader_kv_checksum(
+    struct raft_instance *ri,
+    const struct raft_append_entries_request_msg *raerq)
+{
+    if (!ri || !raerq)
+        return;
+
+    if (raerq->raerqm_last_applied_index < 0)
+        return;
+
+    const struct raft_last_applied *local = &ri->ri_last_applied;
+
+    if (local->rla_idx != raerq->raerqm_last_applied_index)
+        return;
+
+    raft_server_assert_kv_checksum_match(
+        ri, "leader->follower", local->rla_idx,
+        raerq->raerqm_last_applied_kv_crc, local->rla_kv_cumulative_crc);
+}
+
+static void
+raft_server_verify_follower_kv_checksum(
+    struct raft_instance *ri,
+    const struct raft_append_entries_reply_msg *raerp)
+{
+    if (!ri || !raerp)
+        return;
+
+    if (raerp->raerpm_last_applied_index < 0)
+        return;
+
+    const struct raft_last_applied *local = &ri->ri_last_applied;
+
+    if (local->rla_idx != raerp->raerpm_last_applied_index)
+        return;
+
+    raft_server_assert_kv_checksum_match(
+        ri, "follower->leader", local->rla_idx, local->rla_kv_cumulative_crc,
+        raerp->raerpm_last_applied_kv_crc);
+}
+
 static raft_server_epoll_sm_apply_bool_t
 raft_server_net_client_request_init_sm_apply(
     struct raft_instance *ri, struct raft_net_client_request_handle *rncr,
@@ -5490,7 +5571,9 @@ raft_server_instance_init(struct raft_instance *ri,
         .rla_idx = -1,
         .rla_sub_idx = 0,
         .rla_sub_idx_max = 0,
-        .rla_synced_idx = -1
+        .rla_synced_idx = -1,
+        .rla_cumulative_crc = 0,
+        .rla_kv_cumulative_crc = 0
     };
     ri->ri_checkpoint_last_idx = -1;
     ri->ri_pending_read_idx = -1;
