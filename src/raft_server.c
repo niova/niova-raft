@@ -72,10 +72,141 @@ raft_server_verify_leader_kv_checksum(
 static void
 raft_server_verify_follower_kv_checksum(
     struct raft_instance *,
-    const struct raft_append_entries_reply_msg *);
+    const struct raft_append_entries_reply_msg *, const uuid_t);
 
 static const char *
 raft_server_may_accept_client_request_reason(struct raft_instance *ri);
+
+/* EV experiment instrumentation (not part of the design):
+ *   NIOVA_EV_MODE=log        log mismatches instead of asserting
+ *   NIOVA_EV_INJECT_IDX=<n>  flip one byte of the first user-CF value applied
+ *                            at raft index n on this peer
+ * Counters are printed once per second as EV_STATS.
+ */
+static struct
+{
+    bool               init;
+    bool               log_only;
+    raft_entry_idx_t   inject_idx;
+    unsigned int       inject_xor;
+    bool               quorum;
+    raft_entry_idx_t   quorum_verified_idx;
+    unsigned long long quorum_decisions;
+    raft_entry_idx_t   fence_idx[CTL_SVC_MAX_RAFT_PEERS];
+    raft_entry_idx_t   halt_idx;
+    long long          halt_set_ms;
+    unsigned long long match;
+    unsigned long long skip;
+    unsigned long long mismatch;
+    raft_entry_idx_t   last_verified_idx;
+    raft_entry_idx_t   first_mismatch_idx;
+    long long          last_stats_ms;
+} raftEv = {.inject_idx = -1, .last_verified_idx = -1,
+            .first_mismatch_idx = -1, .quorum_verified_idx = -1,
+            .halt_idx = -1, .inject_xor = 1};
+
+/* Quorum policy (prototype of the option discussed in niova-raft #24/#27):
+ * every node records its own (applied idx, kv crc) after each entry; the leader
+ * also records what each follower reports in AE replies.  For an index I the
+ * leader counts matching values across members:
+ *   - a value held by a majority  -> I is quorum-verified; members holding a
+ *     different value are fenced (the leader fences itself);
+ *   - no value can still reach a majority -> the cluster is halted.
+ */
+#define EV_HIST 4096
+struct raft_ev_hist { raft_entry_idx_t idx; crc32_t crc; };
+static struct raft_ev_hist raftEvHist[CTL_SVC_MAX_RAFT_PEERS][EV_HIST];
+
+static void
+raft_server_ev_record(raft_peer_t peer, raft_entry_idx_t idx, crc32_t crc)
+{
+    if (peer >= CTL_SVC_MAX_RAFT_PEERS || idx < 0)
+        return;
+    struct raft_ev_hist *h = &raftEvHist[peer][idx % EV_HIST];
+    h->idx = idx;
+    h->crc = crc;
+}
+
+static bool
+raft_server_ev_lookup(raft_peer_t peer, raft_entry_idx_t idx, crc32_t *crc)
+{
+    const struct raft_ev_hist *h = &raftEvHist[peer][idx % EV_HIST];
+    if (h->idx != idx || idx < 0)
+        return false;
+    *crc = h->crc;
+    return true;
+}
+
+static void
+raft_server_ev_exit(const char *what, int code)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    SIMPLE_LOG_MSG(LL_WARN, "EV_EXIT t_ms=%lld reason=%s code=%d",
+                   (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000, what,
+                   code);
+    fflush(stdout);
+    fflush(stderr);
+    _exit(code);
+}
+
+static long long
+raft_server_ev_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void
+raft_server_ev_init(void)
+{
+    if (raftEv.init)
+        return;
+
+    raftEv.init = true;
+    const char *m = getenv("NIOVA_EV_MODE");
+    raftEv.log_only = (m && !strcmp(m, "log"));
+    const char *x = getenv("NIOVA_EV_INJECT_IDX");
+    if (x)
+        raftEv.inject_idx = strtoll(x, NULL, 10);
+    const char *xm = getenv("NIOVA_EV_INJECT_XOR");
+    if (xm)
+        raftEv.inject_xor = (unsigned int)strtoul(xm, NULL, 0) & 0xff;
+    const char *pol = getenv("NIOVA_EV_POLICY");
+    raftEv.quorum = (pol && !strcmp(pol, "quorum"));
+    for (int i = 0; i < CTL_SVC_MAX_RAFT_PEERS; i++)
+    {
+        raftEv.fence_idx[i] = -1;
+        for (int j = 0; j < EV_HIST; j++)
+            raftEvHist[i][j].idx = -1;
+    }
+
+    SIMPLE_LOG_MSG(LL_WARN,
+                   "EV_CONFIG log_only=%d inject_idx=%ld inject_xor=%#x policy=%s",
+                   raftEv.log_only, raftEv.inject_idx, raftEv.inject_xor,
+                   raftEv.quorum ? "quorum" : "leader");
+}
+
+static void
+raft_server_ev_stats(struct raft_instance *ri)
+{
+    long long now = raft_server_ev_now_ms();
+    if (now - raftEv.last_stats_ms < 1000)
+        return;
+
+    raftEv.last_stats_ms = now;
+    SIMPLE_LOG_MSG(LL_WARN,
+                   "EV_STATS t_ms=%lld leader=%d applied=%ld commit=%ld "
+                   "last_verified=%ld match=%llu skip=%llu mismatch=%llu "
+                   "first_mismatch=%ld quorum_verified=%ld decisions=%llu",
+                   now, raft_instance_is_leader(ri),
+                   ri->ri_last_applied.rla_idx, ri->ri_commit_idx,
+                   raftEv.last_verified_idx, raftEv.match, raftEv.skip,
+                   raftEv.mismatch, raftEv.first_mismatch_idx,
+                   raftEv.quorum_verified_idx, raftEv.quorum_decisions);
+}
+
 
 static raft_net_timerfd_cb_ctx_t
 raft_server_leader_co_wr_timer_expired(struct raft_instance *ri);
@@ -2599,6 +2730,12 @@ raft_server_leader_init_append_entry_msg(struct raft_instance *ri,
     raerq->raerqm_lowest_index = niova_atomic_read(&ri->ri_lowest_idx);
     raerq->raerqm_chkpt_index = ri->ri_checkpoint_last_idx;
     raerq->raerqm_last_applied_index = ri->ri_last_applied.rla_idx;
+    raft_server_ev_init();
+    raerq->raerqm_ev_fence_idx = raftEv.fence_idx[follower];
+    raerq->raerqm_ev_halt_idx = raftEv.halt_idx;
+    if (raftEv.halt_idx >= 0 &&
+        raft_server_ev_now_ms() - raftEv.halt_set_ms > 1000)
+        raft_server_ev_exit("cluster halt (leader)", 72);
     raerq->raerqm_last_applied_kv_crc = ri->ri_last_applied.rla_kv_cumulative_crc;
     memset(raerq->raerqm_size_arr, 0,
            (sizeof(uint32_t) * RAFT_ENTRY_NUM_ENTRIES));
@@ -3881,7 +4018,8 @@ raft_server_process_append_entries_reply(struct raft_instance *ri,
     }
     else
     {
-        raft_server_verify_follower_kv_checksum(ri, raerp);
+        raft_server_verify_follower_kv_checksum(ri, raerp,
+                                                sender_csn->csn_uuid);
         raft_server_apply_append_entries_reply_result(ri, sender_csn->csn_uuid,
                                                       raerp);
     }
@@ -4925,67 +5063,72 @@ raft_server_sm_apply_opt(struct raft_instance *ri,
         ri->ri_backend->rib_sm_apply_opt(ri, ws);
 }
 
-/* EV experiment instrumentation (not part of the design):
- *   NIOVA_EV_MODE=log        log mismatches instead of asserting
- *   NIOVA_EV_INJECT_IDX=<n>  flip one byte of the first user-CF value applied
- *                            at raft index n on this peer
- * Counters are printed once per second as EV_STATS.
- */
-static struct
-{
-    bool               init;
-    bool               log_only;
-    raft_entry_idx_t   inject_idx;
-    unsigned long long match;
-    unsigned long long skip;
-    unsigned long long mismatch;
-    raft_entry_idx_t   last_verified_idx;
-    raft_entry_idx_t   first_mismatch_idx;
-    long long          last_stats_ms;
-} raftEv = {.inject_idx = -1, .last_verified_idx = -1,
-            .first_mismatch_idx = -1};
-
-static long long
-raft_server_ev_now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
+static raft_peer_t
+raft_server_instance_self_idx(const struct raft_instance *ri);
 
 static void
-raft_server_ev_init(void)
+raft_server_ev_quorum_decide(struct raft_instance *ri, raft_entry_idx_t idx)
 {
-    if (raftEv.init)
-        return;
+    const raft_peer_t n = raft_num_members_validate_and_get(ri);
+    const raft_peer_t self = raft_server_instance_self_idx(ri);
+    const int maj = n / 2 + 1;
 
-    raftEv.init = true;
-    const char *m = getenv("NIOVA_EV_MODE");
-    raftEv.log_only = (m && !strcmp(m, "log"));
-    const char *x = getenv("NIOVA_EV_INJECT_IDX");
-    if (x)
-        raftEv.inject_idx = strtoll(x, NULL, 10);
+    crc32_t vals[CTL_SVC_MAX_RAFT_PEERS];
+    bool have[CTL_SVC_MAX_RAFT_PEERS] = {0};
+    int missing = 0;
 
-    SIMPLE_LOG_MSG(LL_WARN, "EV_CONFIG log_only=%d inject_idx=%ld",
-                   raftEv.log_only, raftEv.inject_idx);
-}
+    for (raft_peer_t p = 0; p < n; p++)
+        if (!(have[p] = raft_server_ev_lookup(p, idx, &vals[p])))
+            missing++;
 
-static void
-raft_server_ev_stats(struct raft_instance *ri)
-{
-    long long now = raft_server_ev_now_ms();
-    if (now - raftEv.last_stats_ms < 1000)
-        return;
+    int best = 0;
+    crc32_t best_val = 0;
+    for (raft_peer_t p = 0; p < n; p++)
+    {
+        if (!have[p])
+            continue;
+        int cnt = 0;
+        for (raft_peer_t q = 0; q < n; q++)
+            if (have[q] && vals[q] == vals[p])
+                cnt++;
+        if (cnt > best)
+        {
+            best = cnt;
+            best_val = vals[p];
+        }
+    }
 
-    raftEv.last_stats_ms = now;
-    SIMPLE_LOG_MSG(LL_WARN,
-                   "EV_STATS t_ms=%lld leader=%d applied=%ld commit=%ld "
-                   "last_verified=%ld match=%llu skip=%llu mismatch=%llu "
-                   "first_mismatch=%ld",
-                   now, raft_instance_is_leader(ri),
-                   ri->ri_last_applied.rla_idx, ri->ri_commit_idx,
-                   raftEv.last_verified_idx, raftEv.match, raftEv.skip,
-                   raftEv.mismatch, raftEv.first_mismatch_idx);
+    if (best >= maj)
+    {
+        if (idx > raftEv.quorum_verified_idx)
+            raftEv.quorum_verified_idx = idx;
+
+        for (raft_peer_t p = 0; p < n; p++)
+        {
+            if (!have[p] || vals[p] == best_val || raftEv.fence_idx[p] >= 0)
+                continue;
+
+            raftEv.quorum_decisions++;
+            raftEv.fence_idx[p] = idx;
+            SIMPLE_LOG_MSG(LL_WARN,
+                           "EV_FENCE t_ms=%lld idx=%ld peer=%d self=%d "
+                           "agree=%d/%d majority_crc=%#x peer_crc=%#x",
+                           raft_server_ev_now_ms(), idx, p, self, best, n,
+                           best_val, vals[p]);
+            if (p == self)
+                raft_server_ev_exit("self-fence: leader in minority", 73);
+        }
+    }
+    else if (best + missing < maj && raftEv.halt_idx < 0)
+    {
+        raftEv.quorum_decisions++;
+        raftEv.halt_idx = idx;
+        raftEv.halt_set_ms = raft_server_ev_now_ms();
+        SIMPLE_LOG_MSG(LL_WARN,
+                       "EV_HALT t_ms=%lld idx=%ld best=%d missing=%d n=%d "
+                       "(no majority value possible)",
+                       raftEv.halt_set_ms, idx, best, missing, n);
+    }
 }
 
 static void
@@ -5035,6 +5178,27 @@ raft_server_verify_leader_kv_checksum(
     if (!ri || !raerq)
         return;
 
+    raft_server_ev_init();
+
+    if (raerq->raerqm_ev_halt_idx >= 0)
+    {
+        SIMPLE_LOG_MSG(LL_WARN, "EV_HALT_RECV t_ms=%lld idx=%ld",
+                       raft_server_ev_now_ms(), raerq->raerqm_ev_halt_idx);
+        raft_server_ev_exit("cluster halt from leader", 72);
+    }
+    if (raerq->raerqm_ev_fence_idx >= 0)
+    {
+        SIMPLE_LOG_MSG(LL_WARN, "EV_FENCED t_ms=%lld idx=%ld",
+                       raft_server_ev_now_ms(), raerq->raerqm_ev_fence_idx);
+        raft_server_ev_exit("fenced by quorum", 71);
+    }
+
+    if (raftEv.quorum)
+    {
+        raft_server_ev_stats(ri);
+        return;
+    }
+
     if (raerq->raerqm_last_applied_index < 0)
         return;
 
@@ -5055,13 +5219,25 @@ raft_server_verify_leader_kv_checksum(
 static void
 raft_server_verify_follower_kv_checksum(
     struct raft_instance *ri,
-    const struct raft_append_entries_reply_msg *raerp)
+    const struct raft_append_entries_reply_msg *raerp,
+    const uuid_t raerp_sender)
 {
     if (!ri || !raerp)
         return;
 
     if (raerp->raerpm_last_applied_index < 0)
         return;
+
+    raft_server_ev_init();
+    if (raftEv.quorum)
+    {
+        raft_peer_t p = raft_peer_2_idx(ri, raerp_sender);
+        raft_server_ev_record(p, raerp->raerpm_last_applied_index,
+                              raerp->raerpm_last_applied_kv_crc);
+        raft_server_ev_quorum_decide(ri, raerp->raerpm_last_applied_index);
+        raft_server_ev_stats(ri);
+        return;
+    }
 
     const struct raft_last_applied *local = &ri->ri_last_applied;
 
@@ -5126,6 +5302,9 @@ raft_server_set_last_applied(struct raft_instance *ri,
     {
         ri->ri_last_applied.rla_cumulative_crc = nai->rla_cumulative_crc;
         ri->ri_last_applied.rla_kv_cumulative_crc = nai->rla_kv_cumulative_crc;
+        raft_server_ev_init();
+        raft_server_ev_record(raft_server_instance_self_idx(ri), nai->rla_idx,
+                              nai->rla_kv_cumulative_crc);
     }
     else
         nai->rla_sub_idx++;
@@ -5304,6 +5483,7 @@ raft_server_state_machine_apply(struct raft_instance *ri)
             i == nai.rla_sub_idx)
         {
             raftNetEvInjectArmed = true;
+            raftNetEvInjectXor = raftEv.inject_xor;
             raftEv.inject_idx = -1; // once
         }
         rncr.rncr_apply_handler_version = reh.reh_apply_handler_version;

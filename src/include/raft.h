@@ -167,6 +167,8 @@ struct raft_append_entries_request_msg
     uint32_t raerqm_this_idx_crc;
     int64_t  raerqm_last_applied_index;
     uint32_t raerqm_last_applied_kv_crc;
+    int64_t  raerqm_ev_fence_idx;  // >= 0: receiver diverged at this index
+    int64_t  raerqm_ev_halt_idx;   // >= 0: no majority at this index, stop
     uint32_t raerqm_size_arr[RAFT_ENTRY_NUM_ENTRIES];
     uint32_t raerqm_entries_sz;
     uint32_t raerqm_num_entries;

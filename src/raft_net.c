@@ -2339,6 +2339,7 @@ raft_net_write_supp_add(struct raft_net_wr_supp *ws,
 }
 
 bool raftNetEvInjectArmed = false;
+unsigned int raftNetEvInjectXor = 1;
 
 static void
 raft_net_sm_write_supplement_crc_update(
@@ -2374,7 +2375,8 @@ raft_net_sm_write_supplement_crc_update(
     if (raftNetEvInjectArmed && ws->rnws_value && ws->rnws_value_size)
     {
         raftNetEvInjectArmed = false;
-        ((unsigned char *)ws->rnws_value)[ws->rnws_value_size - 1] ^= 0x1;
+        ((unsigned char *)ws->rnws_value)[ws->rnws_value_size - 1] ^=
+            (unsigned char)raftNetEvInjectXor;
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         SIMPLE_LOG_MSG(LL_WARN, "EV_INJECT t_ms=%lld key='%.*s' val_sz=%zu",
