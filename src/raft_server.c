@@ -90,6 +90,7 @@ static struct
     raft_entry_idx_t   inject_idx;
     unsigned int       inject_xor;
     int                inject_role; // 0 any, 1 leader, 2 follower
+    raft_entry_idx_t   crash_idx;
     bool               quorum;
     raft_entry_idx_t   quorum_verified_idx;
     unsigned long long quorum_decisions;
@@ -104,7 +105,7 @@ static struct
     long long          last_stats_ms;
 } raftEv = {.inject_idx = -1, .last_verified_idx = -1,
             .first_mismatch_idx = -1, .quorum_verified_idx = -1,
-            .halt_idx = -1, .inject_xor = 1};
+            .halt_idx = -1, .inject_xor = 1, .crash_idx = -1};
 
 /* Quorum policy (prototype of the option discussed in niova-raft #24/#27):
  * every node records its own (applied idx, kv crc) after each entry; the leader
@@ -174,6 +175,9 @@ raft_server_ev_init(void)
     const char *xm = getenv("NIOVA_EV_INJECT_XOR");
     if (xm)
         raftEv.inject_xor = (unsigned int)strtoul(xm, NULL, 0) & 0xff;
+    const char *cx = getenv("NIOVA_EV_CRASH_IDX");
+    if (cx)
+        raftEv.crash_idx = strtoll(cx, NULL, 10);
     const char *role = getenv("NIOVA_EV_INJECT_ROLE");
     if (role)
         raftEv.inject_role = !strcmp(role, "leader") ? 1 :
@@ -5508,6 +5512,18 @@ raft_server_state_machine_apply(struct raft_instance *ri)
 
         if (!rc)
             raft_server_init_send_reply(ri, rncr);
+
+        /* EV experiment: crash after the first sub-entry of a coalesced entry
+         * at or after crash_idx has been applied and persisted. */
+        if (raftEv.crash_idx >= 0 && nai.rla_idx >= raftEv.crash_idx &&
+            reh.reh_num_entries > 1 && i == 0)
+        {
+            SIMPLE_LOG_MSG(LL_WARN,
+                           "EV_CRASH idx=%ld sub=0/%u persisted-kv-crc=%#x",
+                           nai.rla_idx, reh.reh_num_entries,
+                           ri->ri_last_applied.rla_kv_cumulative_crc);
+            raft_server_ev_exit("crash between sub-entries", 74);
+        }
 
         if (FAULT_INJECT(raft_server_fail_partial_apply))
             SIMPLE_LOG_MSG(LL_FATAL, "Failing after apply at index:%ld sub:%d",
