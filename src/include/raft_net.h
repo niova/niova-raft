@@ -722,6 +722,10 @@ void
 raft_net_sm_write_supplement_enable_kv_crc(struct raft_net_sm_write_supplements *rnsws,
                                            crc32_t seed);
 
+// EV experiment hook: when set, the next user-CF value hashed in the apply
+// phase has one byte flipped before it is hashed and persisted.
+extern bool raftNetEvInjectArmed;
+
 crc32_t
 raft_net_sm_write_supplement_get_kv_crc(
     const struct raft_net_sm_write_supplements *rnsws);

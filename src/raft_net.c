@@ -2338,6 +2338,8 @@ raft_net_write_supp_add(struct raft_net_wr_supp *ws,
     return 0;
 }
 
+bool raftNetEvInjectArmed = false;
+
 static void
 raft_net_sm_write_supplement_crc_update(
     struct raft_net_sm_write_supplements *rnsws,
@@ -2367,6 +2369,18 @@ raft_net_sm_write_supplement_crc_update(
                     ws->rnws_key_size, ws->rnws_value_size);
             return;
         }
+    }
+
+    if (raftNetEvInjectArmed && ws->rnws_value && ws->rnws_value_size)
+    {
+        raftNetEvInjectArmed = false;
+        ((unsigned char *)ws->rnws_value)[ws->rnws_value_size - 1] ^= 0x1;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        SIMPLE_LOG_MSG(LL_WARN, "EV_INJECT t_ms=%lld key='%.*s' val_sz=%zu",
+                       (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000,
+                       (int)MIN(ws->rnws_key_size, 64), ws->rnws_key,
+                       ws->rnws_value_size);
     }
 
     crc32_t old_crc = rnsws->rnsws_kv_crc;

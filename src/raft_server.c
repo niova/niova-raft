@@ -4925,6 +4925,69 @@ raft_server_sm_apply_opt(struct raft_instance *ri,
         ri->ri_backend->rib_sm_apply_opt(ri, ws);
 }
 
+/* EV experiment instrumentation (not part of the design):
+ *   NIOVA_EV_MODE=log        log mismatches instead of asserting
+ *   NIOVA_EV_INJECT_IDX=<n>  flip one byte of the first user-CF value applied
+ *                            at raft index n on this peer
+ * Counters are printed once per second as EV_STATS.
+ */
+static struct
+{
+    bool               init;
+    bool               log_only;
+    raft_entry_idx_t   inject_idx;
+    unsigned long long match;
+    unsigned long long skip;
+    unsigned long long mismatch;
+    raft_entry_idx_t   last_verified_idx;
+    raft_entry_idx_t   first_mismatch_idx;
+    long long          last_stats_ms;
+} raftEv = {.inject_idx = -1, .last_verified_idx = -1,
+            .first_mismatch_idx = -1};
+
+static long long
+raft_server_ev_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void
+raft_server_ev_init(void)
+{
+    if (raftEv.init)
+        return;
+
+    raftEv.init = true;
+    const char *m = getenv("NIOVA_EV_MODE");
+    raftEv.log_only = (m && !strcmp(m, "log"));
+    const char *x = getenv("NIOVA_EV_INJECT_IDX");
+    if (x)
+        raftEv.inject_idx = strtoll(x, NULL, 10);
+
+    SIMPLE_LOG_MSG(LL_WARN, "EV_CONFIG log_only=%d inject_idx=%ld",
+                   raftEv.log_only, raftEv.inject_idx);
+}
+
+static void
+raft_server_ev_stats(struct raft_instance *ri)
+{
+    long long now = raft_server_ev_now_ms();
+    if (now - raftEv.last_stats_ms < 1000)
+        return;
+
+    raftEv.last_stats_ms = now;
+    SIMPLE_LOG_MSG(LL_WARN,
+                   "EV_STATS t_ms=%lld leader=%d applied=%ld commit=%ld "
+                   "last_verified=%ld match=%llu skip=%llu mismatch=%llu "
+                   "first_mismatch=%ld",
+                   now, raft_instance_is_leader(ri),
+                   ri->ri_last_applied.rla_idx, ri->ri_commit_idx,
+                   raftEv.last_verified_idx, raftEv.match, raftEv.skip,
+                   raftEv.mismatch, raftEv.first_mismatch_idx);
+}
+
 static void
 raft_server_assert_kv_checksum_match(struct raft_instance *ri,
                                      const char *context,
@@ -4932,7 +4995,29 @@ raft_server_assert_kv_checksum_match(struct raft_instance *ri,
                                      uint32_t expected_crc,
                                      uint32_t observed_crc)
 {
+    raft_server_ev_init();
+    raft_server_ev_stats(ri);
+
     if (expected_crc == observed_crc)
+    {
+        raftEv.match++;
+        raftEv.last_verified_idx = apply_idx;
+        return;
+    }
+
+    raftEv.mismatch++;
+    if (raftEv.first_mismatch_idx < 0)
+    {
+        raftEv.first_mismatch_idx = apply_idx;
+        SIMPLE_LOG_MSG(LL_WARN,
+                       "EV_DETECT t_ms=%lld ctx=%s apply-idx=%ld leader=%d "
+                       "expected=%#x observed=%#x",
+                       raft_server_ev_now_ms(), context, apply_idx,
+                       raft_instance_is_leader(ri), expected_crc,
+                       observed_crc);
+    }
+
+    if (raftEv.log_only)
         return;
 
     SIMPLE_LOG_MSG(LL_FATAL,
@@ -4956,7 +5041,11 @@ raft_server_verify_leader_kv_checksum(
     const struct raft_last_applied *local = &ri->ri_last_applied;
 
     if (local->rla_idx != raerq->raerqm_last_applied_index)
+    {
+        raftEv.skip++;
+        raft_server_ev_stats(ri);
         return;
+    }
 
     raft_server_assert_kv_checksum_match(
         ri, "leader->follower", local->rla_idx,
@@ -4977,7 +5066,11 @@ raft_server_verify_follower_kv_checksum(
     const struct raft_last_applied *local = &ri->ri_last_applied;
 
     if (local->rla_idx != raerp->raerpm_last_applied_index)
+    {
+        raftEv.skip++;
+        raft_server_ev_stats(ri);
         return;
+    }
 
     raft_server_assert_kv_checksum_match(
         ri, "follower->leader", local->rla_idx, local->rla_kv_cumulative_crc,
@@ -5205,6 +5298,14 @@ raft_server_state_machine_apply(struct raft_instance *ri)
                                                     reply_buf_sz);
         raft_net_sm_write_supplement_enable_kv_crc(
             &rncr.rncr_sm_write_supp, nai.rla_kv_cumulative_crc);
+
+        raft_server_ev_init();
+        if (raftEv.inject_idx >= 0 && nai.rla_idx == raftEv.inject_idx &&
+            i == nai.rla_sub_idx)
+        {
+            raftNetEvInjectArmed = true;
+            raftEv.inject_idx = -1; // once
+        }
         rncr.rncr_apply_handler_version = reh.reh_apply_handler_version;
 
         rc = ri->ri_server_sm_request_cb(&rncr);
